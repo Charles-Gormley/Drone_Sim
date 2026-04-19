@@ -1,11 +1,10 @@
 mod environment;
+mod quadtree;
 mod drone;
 
 use macroquad::prelude::*;
 use environment::Environment;
 use drone::Drone;
-
-const FOG_OVERDRAW_MARGIN: f32 = 20000.0;
 
 fn window_conf() -> Conf {
     Conf {
@@ -23,23 +22,9 @@ async fn main() {
 
     let mut is_map_open = false;
     let mut is_person_controlled = true;
+    let mut current_tick: u64 = 0;
 
-    // Generate fog of war mask texture
     let scan_radius = drone.scan_radius;
-    let tex_size = (scan_radius * 2.0) as u32;
-    let mut mask_img = Image::gen_image_color(tex_size as u16, tex_size as u16, BLACK);
-    let r_sq = scan_radius * scan_radius;
-    
-    for y in 0..tex_size {
-        for x in 0..tex_size {
-            let dx = (x as f32) - scan_radius;
-            let dy = (y as f32) - scan_radius;
-            if dx * dx + dy * dy < r_sq {
-                mask_img.set_pixel(x, y, Color::new(0.0, 0.0, 0.0, 0.0)); // Transparent hole
-            }
-        }
-    }
-    let mask_texture = Texture2D::from_image(&mask_img);
 
     loop {
         let dt = get_frame_time();
@@ -51,7 +36,15 @@ async fn main() {
             is_person_controlled = !is_person_controlled;
         }
 
-        drone.update(is_person_controlled, &env, dt);
+        drone.update(is_person_controlled, &env, dt, current_tick);
+        current_tick += 1;
+
+        if current_tick % 60 == 0 {
+            let diff = drone.map.diff_since(0);
+            if let Ok(bytes) = bincode::serialize(&diff) {
+                println!("Tick {}: Full map state size: {} bytes", current_tick, bytes.len());
+            }
+        }
 
         clear_background(Color::new(0.1, 0.1, 0.1, 1.0));
 
@@ -61,28 +54,27 @@ async fn main() {
             ..Default::default()
         };
 
-        if is_map_open {
-        }
-
         set_camera(&camera);
 
-        env.draw();
-        drone.draw();
+        let camera_bounds = Rect::new(
+            camera.target.x - screen_width() / camera.zoom.x.abs() / 2.0,
+            camera.target.y - screen_height() / camera.zoom.y.abs() / 2.0,
+            screen_width() / camera.zoom.x.abs(),
+            screen_height() / camera.zoom.y.abs()
+        );
 
-        if !is_map_open {
+        if is_map_open {
+            env.draw();
+        } else {
+            drone.map.draw(camera_bounds);
+            
             let cx = drone.position.x;
             let cy = drone.position.y;
             let r = scan_radius;
-            
-            draw_rectangle(cx - FOG_OVERDRAW_MARGIN, cy - FOG_OVERDRAW_MARGIN, FOG_OVERDRAW_MARGIN * 2.0, FOG_OVERDRAW_MARGIN - r, BLACK);
-            draw_rectangle(cx - FOG_OVERDRAW_MARGIN, cy + r, FOG_OVERDRAW_MARGIN * 2.0, FOG_OVERDRAW_MARGIN - r, BLACK);
-            draw_rectangle(cx - FOG_OVERDRAW_MARGIN, cy - r, FOG_OVERDRAW_MARGIN - r, r * 2.0, BLACK);
-            draw_rectangle(cx + r, cy - r, FOG_OVERDRAW_MARGIN - r, r * 2.0, BLACK);
-
-            draw_texture(&mask_texture, cx - r, cy - r, WHITE);
-            
-            draw_circle_lines(cx, cy, r, 2.0, GRAY);
+            draw_circle_lines(cx, cy, r, 2.0, Color::new(1.0, 1.0, 1.0, 0.3));
         }
+
+        drone.draw();
 
         set_default_camera();
 

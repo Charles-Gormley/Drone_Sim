@@ -1,5 +1,6 @@
 use macroquad::prelude::*;
 use crate::environment::Environment;
+use crate::quadtree::Quadtree;
 
 const MOVE_SPEED: f32 = 500.0;
 const TURN_SPEED: f32 = 3.0;
@@ -11,6 +12,7 @@ pub struct Drone {
     pub(crate) heading: f32,
     pub(crate) scan_radius: f32,
     pub(crate) radius: f32,
+    pub map: Quadtree,
 }
 
 impl Drone {
@@ -21,10 +23,11 @@ impl Drone {
             heading: 0.0,
             scan_radius: 300.0,
             radius: 10.0,
+            map: Quadtree::new(Rect::new(0.0, 0.0, crate::environment::MAP_WIDTH, crate::environment::MAP_HEIGHT), 9),
         }
     }
 
-    pub fn update(&mut self, is_controlled: bool, env: &Environment, dt: f32) {
+    pub fn update(&mut self, is_controlled: bool, env: &Environment, dt: f32, current_tick: u64) {
         let mut acceleration = vec2(0.0, 0.0);
 
         if is_controlled {
@@ -62,6 +65,8 @@ impl Drone {
         } else {
             self.position = next_pos;
         }
+
+        self.map.insert_scan(self.position, self.scan_radius, env, current_tick);
     }
 
     pub fn draw(&self) {
