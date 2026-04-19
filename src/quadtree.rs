@@ -140,6 +140,40 @@ impl Quadtree {
         QuadNode::Internal(children)
     }
 
+    pub(crate) fn query_point(&self, point: Vec2) -> Option<CellState> {
+        Self::query_node(&self.root, self.bounds, point)
+    }
+
+    fn query_node(node: &QuadNode, bounds: Rect, point: Vec2) -> Option<CellState> {
+        if !bounds.contains(point) {
+            return None;
+        }
+
+        match node {
+            QuadNode::Leaf(state) => Some(*state),
+            QuadNode::Internal(children) => {
+                let hw = bounds.w / 2.0;
+                let hh = bounds.h / 2.0;
+                let x = bounds.x;
+                let y = bounds.y;
+
+                let quadrants = [
+                    Rect::new(x, y, hw, hh),
+                    Rect::new(x + hw, y, hw, hh),
+                    Rect::new(x, y + hh, hw, hh),
+                    Rect::new(x + hw, y + hh, hw, hh),
+                ];
+
+                for i in 0..4 {
+                    if let Some(state) = Self::query_node(&children[i], quadrants[i], point) {
+                        return Some(state);
+                    }
+                }
+                None
+            }
+        }
+    }
+
     pub fn diff_since(&self, since_tick: u64) -> MapDiff {
         let mut updates = Vec::new();
         Self::collect_diff(&self.root, self.bounds, since_tick, &mut updates);

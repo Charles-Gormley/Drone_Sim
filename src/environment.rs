@@ -31,9 +31,14 @@ impl Environment {
             let height = 50.0 + rand_f32() * 200.0;
             let x = rand_f32() * (MAP_WIDTH - width);
             let y = rand_f32() * (MAP_HEIGHT - height);
-            obstacles.push(Obstacle {
-                rect: Rect::new(x, y, width, height),
-            });
+            
+            let rect = Rect::new(x, y, width, height);
+            let center = vec2(MAP_WIDTH / 2.0, MAP_HEIGHT / 2.0);
+            let center_rect = Rect::new(center.x - 200.0, center.y - 200.0, 400.0, 400.0);
+            
+            if !rect.overlaps(&center_rect) {
+                obstacles.push(Obstacle { rect });
+            }
         }
 
         Self { obstacles }
