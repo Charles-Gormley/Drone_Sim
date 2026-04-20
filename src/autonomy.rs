@@ -25,6 +25,10 @@ pub struct AutonomyState {
     pub(crate) banned_frontiers: Vec<Vec2>,
     /// Countdown timer for forced periodic repathing.
     pub(crate) repath_timer: f32,
+    /// Pre-allocated grid for pathfinding and frontier detection.
+    pub(crate) grid: Vec<u8>,
+    /// Pre-allocated grid for staleness calculation.
+    pub(crate) last_seen_grid: Vec<u64>,
 }
 
 impl Default for AutonomyState {
@@ -36,8 +40,15 @@ impl Default for AutonomyState {
             recalculate_cooldown: 0.0,
             banned_frontiers: Vec::new(),
             repath_timer: 0.0,
+            grid: vec![CELL_UNKNOWN; (GRID_WIDTH * GRID_HEIGHT) as usize],
+            last_seen_grid: vec![0u64; (GRID_WIDTH * GRID_HEIGHT) as usize],
         }
     }
+}
+
+pub struct SwarmContext<'a> {
+    pub peer_positions: &'a [(f32, f32)],
+    pub peer_paths: &'a [Option<Vec<(f32, f32)>>],
 }
 
 impl AutonomyState {
@@ -60,8 +71,8 @@ impl AutonomyState {
         position: Vec2,
         map: &Quadtree,
         dt: f32,
-        peer_positions: &[(f32, f32)],
-        peer_paths: &[Option<Vec<(f32, f32)>>],
+        current_tick: u64,
+        swarm: &SwarmContext,
     ) {
         if self.recalculate_cooldown > 0.0 {
             self.recalculate_cooldown -= dt;
@@ -73,26 +84,32 @@ impl AutonomyState {
         if self.path.is_none() || self.path.as_ref().unwrap().is_empty() || self.repath_timer <= 0.0 {
             self.repath_timer = 0.25;
 
-            let mut grid = vec![CELL_UNKNOWN; (GRID_WIDTH * GRID_HEIGHT) as usize];
+            // Clear the pre-allocated grids
+            self.grid.fill(CELL_UNKNOWN);
+            self.last_seen_grid.fill(0);
+
             for y in 0..GRID_HEIGHT {
                 for x in 0..GRID_WIDTH {
                     let center = vec2(x as f32 * GRID_RES + GRID_RES / 2.0, y as f32 * GRID_RES + GRID_RES / 2.0);
                     if let Some(s) = map.query_point(center) {
+                        self.last_seen_grid[(y * GRID_WIDTH + x) as usize] = s.last_seen;
                         if s.obstacle {
-                            grid[(y * GRID_WIDTH + x) as usize] = CELL_OBSTACLE;
+                            self.grid[(y * GRID_WIDTH + x) as usize] = CELL_OBSTACLE;
                         } else if s.explored {
-                            grid[(y * GRID_WIDTH + x) as usize] = CELL_EXPLORED;
+                            self.grid[(y * GRID_WIDTH + x) as usize] = CELL_EXPLORED;
                         }
                     }
                 }
             }
 
             // Reuse the existing Vec to avoid re-allocation every 250ms
-            find_frontiers(&grid, &mut self.all_frontiers);
+            let mut frontier_values = Vec::new();
+            find_frontiers(&self.grid, &self.last_seen_grid, current_tick, &mut frontier_values);
+            self.all_frontiers = frontier_values.iter().map(|(p, _)| *p).collect();
 
-            if let Some(target) = pick_nearest_frontier(position, &self.all_frontiers, &self.banned_frontiers, peer_positions, peer_paths) {
+            if let Some(target) = pick_nearest_frontier(position, &frontier_values, &self.banned_frontiers, swarm) {
                 self.target_frontier = Some(target);
-                self.path = calculate_path(position, target, &grid);
+                self.path = calculate_path(position, target, &self.grid);
 
                 if self.path.is_none() {
                     println!("WARNING: Target frontier at {:?} is unreachable. Banning it.", target);
@@ -120,69 +137,72 @@ pub fn update_autonomy(
     position: Vec2,
     map: &Quadtree,
     dt: f32,
-    peer_positions: &[(f32, f32)],
-    peer_paths: &[Option<Vec<(f32, f32)>>],
+    current_tick: u64,
+    swarm: &SwarmContext,
 ) {
-    state.update(position, map, dt, peer_positions, peer_paths);
+    state.update(position, map, dt, current_tick, swarm);
 }
 
 fn pick_nearest_frontier(
     position: Vec2,
-    frontiers: &[Vec2],
+    frontiers: &[(Vec2, f32)],
     banned: &[Vec2],
-    peer_positions: &[(f32, f32)],
-    peer_paths: &[Option<Vec<(f32, f32)>>],
+    swarm: &SwarmContext,
 ) -> Option<Vec2> {
     let mut best = None;
-    let mut min_score = f32::MAX;
+    let mut max_utility = f32::MIN;
 
-    for &f in frontiers {
+    for &(f, value) in frontiers {
         if banned.iter().any(|&b| b.distance_squared(f) < 1.0) {
             continue;
         }
 
-        let mut score = position.distance_squared(f);
+        let distance_cost = position.distance(f);
+        let mut peer_cost = 0.0;
 
         // Penalize frontiers near other drones' current positions
-        for &(px, py) in peer_positions {
+        for &(px, py) in swarm.peer_positions {
             let peer_pos = vec2(px, py);
-            let peer_dist = peer_pos.distance_squared(f);
-            if peer_dist < 500.0 * 500.0 {
-                // The closer the peer is to this frontier, the heavier the penalty
-                score += (500.0 * 500.0 - peer_dist) * 2.0;
+            let peer_dist = peer_pos.distance(f);
+            if peer_dist < 500.0 {
+                peer_cost += (500.0 - peer_dist) * 2.0;
             }
         }
 
         // Penalize frontiers near other drones' planned paths
-        for path_opt in peer_paths {
+        for path_opt in swarm.peer_paths {
             if let Some(path) = path_opt {
                 for &(wx, wy) in path {
                     let waypoint = vec2(wx, wy);
-                    let wp_dist = waypoint.distance_squared(f);
-                    if wp_dist < 300.0 * 300.0 {
-                        score += (300.0 * 300.0 - wp_dist) * 1.0;
+                    let wp_dist = waypoint.distance(f);
+                    if wp_dist < 300.0 {
+                        peer_cost += (300.0 - wp_dist) * 1.5;
                     }
                 }
             }
         }
 
-        if score < min_score {
-            min_score = score;
+        let cost = distance_cost + peer_cost;
+        let utility = value - cost;
+
+        if utility > max_utility {
+            max_utility = utility;
             best = Some(f);
         }
     }
     best
 }
 
-fn find_frontiers(grid: &[u8], frontiers: &mut Vec<Vec2>) {
+fn find_frontiers(grid: &[u8], last_seen_grid: &[u64], current_tick: u64, frontiers: &mut Vec<(Vec2, f32)>) {
     frontiers.clear();
+    let mut has_unknown_frontiers = false;
 
     for y in 0..GRID_HEIGHT {
         for x in 0..GRID_WIDTH {
             let idx = (y * GRID_WIDTH + x) as usize;
 
             if grid[idx] == CELL_EXPLORED {
-                let mut is_frontier = false;
+                let mut is_unknown_frontier = false;
                 'outer: for dx in -1..=1 {
                     for dy in -1..=1 {
                         if dx == 0 && dy == 0 { continue; }
@@ -191,19 +211,37 @@ fn find_frontiers(grid: &[u8], frontiers: &mut Vec<Vec2>) {
                         if nx >= 0 && nx < GRID_WIDTH && ny >= 0 && ny < GRID_HEIGHT {
                             let n_idx = (ny * GRID_WIDTH + nx) as usize;
                             if grid[n_idx] == CELL_UNKNOWN {
-                                is_frontier = true;
+                                is_unknown_frontier = true;
                                 break 'outer;
                             }
                         }
                     }
                 }
 
-                if is_frontier {
-                    let center = vec2(x as f32 * GRID_RES + GRID_RES / 2.0, y as f32 * GRID_RES + GRID_RES / 2.0);
-                    frontiers.push(center);
+                let center = vec2(x as f32 * GRID_RES + GRID_RES / 2.0, y as f32 * GRID_RES + GRID_RES / 2.0);
+
+                if is_unknown_frontier {
+                    frontiers.push((center, 1_000_000.0)); // Huge value for unknown frontiers
+                    has_unknown_frontiers = true;
+                } else if !has_unknown_frontiers {
+                    // Collect stale explored cells if we haven't found any unknown frontiers yet.
+                    // If we find an unknown frontier, we will filter these out later.
+                    let age = current_tick.saturating_sub(last_seen_grid[idx]) as f32;
+                    if age > 600.0 { // Must be at least 10 seconds stale
+                        frontiers.push((center, age));
+                    }
                 }
             }
         }
+    }
+
+    // If we found ANY unknown frontiers, discard the stale ones.
+    if has_unknown_frontiers {
+        frontiers.retain(|&(_, val)| val == 1_000_000.0);
+    } else {
+        // If we only have stale frontiers, sort and keep the top 100 stalest to reduce compute
+        frontiers.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        frontiers.truncate(100);
     }
 }
 

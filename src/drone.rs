@@ -6,8 +6,6 @@ use crate::autonomy::{AutonomyState, update_autonomy};
 const MOVE_SPEED: f32 = 500.0;
 const TURN_SPEED: f32 = 3.0;
 const FRICTION: f32 = 0.90;
-/// Base UDP port. Drone N listens on BASE_PORT + N.
-const BASE_PORT: u32 = 8000;
 /// Maximum number of concurrent drone tasks (port scan range).
 const MAX_DRONES: u32 = 10;
 /// Ticks before a silent peer is culled (10s at 16ms/tick).
@@ -55,10 +53,13 @@ impl Drone {
         mut self,
         env: std::sync::Arc<Environment>,
         render_tx: tokio::sync::mpsc::UnboundedSender<crate::RenderEvent>,
+        is_headless: bool,
+        base_port: u32,
     ) {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(16));
+        let tick_ms = if is_headless { 1 } else { 16 };
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(tick_ms));
 
-        let port = BASE_PORT + self.id;
+        let port = base_port + self.id;
         let socket = match tokio::net::UdpSocket::bind(format!("127.0.0.1:{}", port)).await {
             Ok(s) => s,
             Err(e) => {
@@ -72,8 +73,13 @@ impl Drone {
         }
 
         let mut current_tick: u64 = 0;
-        let mut heartbeat_ticker = tokio::time::interval(std::time::Duration::from_secs(2));
-        let mut map_gossip_ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+        
+        // Timer settings: heartbeats ~2s, gossip ~5s (in sim-time)
+        // 16ms/tick * 125 ticks = 2000ms
+        // 16ms/tick * 312 ticks = ~5000ms
+        let heartbeat_interval_ticks = 125;
+        let gossip_interval_ticks = 312;
+        
         let mut last_gossip_tick: u64 = 0;
 
         let (private_key, _public_key) = match crate::network::generate_keypair() {
@@ -98,6 +104,98 @@ impl Drone {
                     if !diff.updates.is_empty() {
                         if let Ok(bytes) = bincode::serialize(&diff) {
                             let _ = render_tx.send(crate::RenderEvent::MapUpdate(bytes));
+                        }
+                    }
+
+                    // ── Heartbeat (Discovery) ──────────────────────────────────
+                    if current_tick % heartbeat_interval_ticks == 0 {
+                        let path_tuples = self.autonomy.path.as_ref().map(|p| {
+                            p.iter().map(|v| (v.x, v.y)).collect::<Vec<_>>()
+                        });
+
+                        let msg = crate::network::Message {
+                            msg_type: crate::network::MsgType::Heartbeat,
+                            sender_id: self.id,
+                            sender_pos: (self.position.x, self.position.y),
+                            path: path_tuples,
+                            peer_list: self.peer_table.keys().copied().collect(),
+                            payload: vec![],
+                            timestamp: current_tick,
+                        };
+                        
+                        if let Ok(msg_bytes) = msg.to_bytes() {
+                            for scan_port in base_port..(base_port + MAX_DRONES) {
+                                if scan_port != base_port + self.id {
+                                    let _ = socket.send_to(&msg_bytes, format!("127.0.0.1:{}", scan_port)).await;
+                                }
+                            }
+                        }
+
+                        let new_peer_ids: Vec<u32> = self.peer_table.keys()
+                            .copied()
+                            .filter(|&pid| pid > self.id)
+                            .filter(|&pid| !sessions.has_session(pid))
+                            .filter(|&pid| !sessions.handshakes.contains_key(&pid))
+                            .collect();
+
+                        for peer_id in new_peer_ids {
+                            match sessions.initiate_handshake(peer_id) {
+                                Ok(hs_msg) => {
+                                    let env = crate::network::Envelope {
+                                        tag: crate::network::HANDSHAKE_TAG,
+                                        sender_id: self.id,
+                                        payload: hs_msg,
+                                    };
+                                    if let Ok(env_bytes) = env.to_bytes() {
+                                        let _ = socket.send_to(&env_bytes, format!("127.0.0.1:{}", base_port + peer_id)).await;
+                                        if !is_headless {
+                                            println!("Drone {} → Drone {}: initiated Noise XX handshake", self.id, peer_id);
+                                        }
+                                    }
+                                }
+                                Err(e) => eprintln!("Drone {}: failed to initiate handshake with {}: {}", self.id, peer_id, e),
+                            }
+                        }
+                    }
+
+                    // ── Map Gossip ─────────────────────────────────────────────
+                    if current_tick % gossip_interval_ticks == 0 {
+                        let diff = self.map.diff_since(last_gossip_tick);
+                        last_gossip_tick = current_tick;
+
+                        if !diff.updates.is_empty() {
+                            if let Ok(plaintext) = bincode::serialize(&diff) {
+                                let msg = crate::network::Message {
+                                    msg_type: crate::network::MsgType::MapDiff,
+                                    sender_id: self.id,
+                                    sender_pos: (self.position.x, self.position.y),
+                                    path: None,
+                                    peer_list: vec![],
+                                    payload: plaintext,
+                                    timestamp: current_tick,
+                                };
+                                if let Ok(msg_bytes) = msg.to_bytes() {
+                                    for peer in self.peer_table.values() {
+                                        if sessions.has_session(peer.id) {
+                                            match sessions.encrypt(peer.id, &msg_bytes) {
+                                                Ok(ciphertext) => {
+                                                    let env = crate::network::Envelope {
+                                                        tag: crate::network::TRANSPORT_TAG,
+                                                        sender_id: self.id,
+                                                        payload: ciphertext,
+                                                    };
+                                                    if let Ok(env_bytes) = env.to_bytes() {
+                                                        let _ = socket.send_to(&env_bytes, format!("127.0.0.1:{}", base_port + peer.id)).await;
+                                                    }
+                                                }
+                                                Err(e) => eprintln!("Drone {}: encrypt error for peer {}: {}", self.id, peer.id, e),
+                                            }
+                                        } else {
+                                            let _ = socket.send_to(&msg_bytes, format!("127.0.0.1:{}", base_port + peer.id)).await;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -128,102 +226,6 @@ impl Drone {
                         break;
                     }
                 }
-                _ = heartbeat_ticker.tick() => {
-                    // Heartbeats are sent PLAINTEXT (unencrypted) — they are used for
-                    // peer discovery, not secret data. This is intentional by design.
-                    let path_tuples = self.autonomy.path.as_ref().map(|p| {
-                        p.iter().map(|v| (v.x, v.y)).collect::<Vec<_>>()
-                    });
-
-                    let msg = crate::network::Message {
-                        msg_type: crate::network::MsgType::Heartbeat,
-                        sender_id: self.id,
-                        sender_pos: (self.position.x, self.position.y),
-                        path: path_tuples,
-                        peer_list: self.peer_table.keys().copied().collect(),
-                        payload: vec![],
-                        timestamp: current_tick,
-                    };
-                    
-                    // Broadcast heartbeat to known port range
-                    if let Ok(msg_bytes) = msg.to_bytes() {
-                    for scan_port in BASE_PORT..(BASE_PORT + MAX_DRONES) {
-                        if scan_port != BASE_PORT + self.id {
-                            let _ = socket.send_to(&msg_bytes, format!("127.0.0.1:{}", scan_port)).await;
-                        }
-                    }
-                    } // end if let Ok(msg_bytes)
-
-                    // Initiate Noise handshake to any HIGHER-id peer without a session.
-                    // Lower-id peer acts as responder — prevents both sides racing to initiate.
-                    // Lower-ID peer will act as responder. This prevents both sides racing.
-                    let new_peer_ids: Vec<u32> = self.peer_table.keys()
-                        .copied()
-                        .filter(|&pid| pid > self.id) // Only initiate to higher-ID peers
-                        .filter(|&pid| !sessions.has_session(pid))
-                        .filter(|&pid| !sessions.handshakes.contains_key(&pid))
-                        .collect();
-
-                    for peer_id in new_peer_ids {
-                        match sessions.initiate_handshake(peer_id) {
-                            Ok(hs_msg) => {
-                                let env = crate::network::Envelope {
-                                    tag: crate::network::HANDSHAKE_TAG,
-                                    sender_id: self.id,
-                                    payload: hs_msg,
-                                };
-                                if let Ok(env_bytes) = env.to_bytes() {
-                                    let _ = socket.send_to(&env_bytes, format!("127.0.0.1:{}", BASE_PORT + peer_id)).await;
-                                    println!("Drone {} → Drone {}: initiated Noise XX handshake", self.id, peer_id);
-                                }
-                            }
-                            Err(e) => eprintln!("Drone {}: failed to initiate handshake with {}: {}", self.id, peer_id, e),
-                        }
-                    }
-                }
-                _ = map_gossip_ticker.tick() => {
-                    // MAP_DIFF is sent ENCRYPTED to peers with established sessions.
-                    let diff = self.map.diff_since(last_gossip_tick);
-                    last_gossip_tick = current_tick;
-
-                    if diff.updates.is_empty() { continue; }
-
-                    if let Ok(plaintext) = bincode::serialize(&diff) {
-                        let msg = crate::network::Message {
-                            msg_type: crate::network::MsgType::MapDiff,
-                            sender_id: self.id,
-                            sender_pos: (self.position.x, self.position.y),
-                            path: None,
-                            peer_list: vec![],
-                            payload: plaintext,
-                            timestamp: current_tick,
-                        };
-                        if let Ok(msg_bytes) = msg.to_bytes() {
-                        for peer in self.peer_table.values() {
-                            if sessions.has_session(peer.id) {
-                                match sessions.encrypt(peer.id, &msg_bytes) {
-                                    Ok(ciphertext) => {
-                                        let env = crate::network::Envelope {
-                                            tag: crate::network::TRANSPORT_TAG,
-                                            sender_id: self.id,
-                                            payload: ciphertext,
-                                        };
-                                        if let Ok(env_bytes) = env.to_bytes() {
-                                            let _ = socket.send_to(&env_bytes, format!("127.0.0.1:{}", BASE_PORT + peer.id)).await;
-                                            println!("Drone {} → Drone {}: sent encrypted MAP_DIFF ({} updates)", self.id, peer.id, diff.updates.len());
-                                        }
-                                    }
-                                    Err(e) => eprintln!("Drone {}: encrypt error for peer {}: {}", self.id, peer.id, e),
-                                }
-                            } else {
-                                // Plaintext fallback — session not yet established
-                                let _ = socket.send_to(&msg_bytes, format!("127.0.0.1:{}", BASE_PORT + peer.id)).await;
-                                println!("Drone {} → Drone {}: MAP_DIFF plaintext (session pending)", self.id, peer.id);
-                            }
-                        }
-                        } // end if let Ok(msg_bytes)
-                    }
-                }
                 result = socket.recv_from(&mut buf) => {
                     if let Ok((len, _addr)) = result {
                         // Try to parse as an Envelope first (handshake or encrypted transport)
@@ -239,7 +241,7 @@ impl Drone {
                                             payload: reply,
                                         };
                                         if let Ok(reply_bytes) = reply_env.to_bytes() {
-                                            let _ = socket.send_to(&reply_bytes, format!("127.0.0.1:{}", BASE_PORT + sender_id)).await;
+                                            let _ = socket.send_to(&reply_bytes, format!("127.0.0.1:{}", base_port + sender_id)).await;
                                         }
                                     }
                                     Ok(None) => { /* handshake complete, no reply needed */ }
@@ -332,7 +334,11 @@ impl Drone {
             }
         } else {
             // Use pre-cached peer data (refreshed at start of this tick, not here)
-            update_autonomy(&mut self.autonomy, self.position, &self.map, dt, &self.cached_peer_positions, &self.cached_peer_paths);
+            let swarm = crate::autonomy::SwarmContext {
+                peer_positions: &self.cached_peer_positions,
+                peer_paths: &self.cached_peer_paths,
+            };
+            update_autonomy(&mut self.autonomy, self.position, &self.map, dt, current_tick, &swarm);
 
             if let Some(ref mut path) = self.autonomy.path {
                 if let Some(target_pos) = path.first() {

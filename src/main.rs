@@ -35,16 +35,93 @@ pub struct RenderState {
 
 fn window_conf() -> Conf {
     Conf {
-        window_title: "Drone Mesh Networking Simulator - Phase 4".to_owned(),
+        window_title: "Drone Mesh Networking Simulator - Phase 6".to_owned(),
         window_width: 1024,
         window_height: 768,
         ..Default::default()
     }
 }
 
-#[macroquad::main(window_conf)]
-async fn main() {
-    let env = Arc::new(Environment::new());
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let is_headless = args.contains(&"--headless".to_string());
+    
+    let mut seed = 12345u32;
+    if let Some(pos) = args.iter().position(|a| a == "--seed") {
+        if pos + 1 < args.len() {
+            if let Ok(s) = args[pos + 1].parse::<u32>() {
+                seed = s;
+            }
+        }
+    }
+
+    let mut base_port = 8000u32;
+    if let Some(pos) = args.iter().position(|a| a == "--port") {
+        if pos + 1 < args.len() {
+            if let Ok(p) = args[pos + 1].parse::<u32>() {
+                base_port = p;
+            }
+        }
+    }
+
+    if is_headless {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            run_headless_simulation(seed, base_port).await;
+        });
+    } else {
+        macroquad::Window::from_config(window_conf(), ui_main(seed, base_port));
+    }
+}
+
+async fn run_headless_simulation(seed: u32, base_port: u32) {
+    let env = Arc::new(Environment::new(seed));
+    let (render_tx, mut render_rx) = mpsc::unbounded_channel();
+    
+    for id in 1..=DRONE_COUNT {
+        let drone = Drone::new(id, environment::MAP_WIDTH / 2.0 + (id as f32 * 50.0), environment::MAP_HEIGHT / 2.0);
+        tokio::spawn(drone.run_drone_task(env.clone(), render_tx.clone(), true, base_port));
+    }
+
+    let mut master_map = quadtree::Quadtree::new(Rect::new(0.0, 0.0, environment::MAP_WIDTH, environment::MAP_HEIGHT), 9);
+    let start_time = std::time::Instant::now();
+    let total_area = environment::MAP_WIDTH * environment::MAP_HEIGHT;
+    
+    println!("--- HEADLESS SIMULATION STARTED (Seed: {}) ---", seed);
+
+    loop {
+        if let Some(event) = render_rx.recv().await {
+            match event {
+                RenderEvent::StateUpdate(_) => {},
+                RenderEvent::MapUpdate(bytes) => {
+                    if let Ok(diff) = bincode::deserialize(&bytes) {
+                        master_map.merge(diff);
+                        let explored = master_map.explored_area();
+                        let percent = (explored / total_area) * 100.0;
+                        
+                        if percent >= 95.0 {
+                            let duration = start_time.elapsed();
+                            println!("\nSUCCESS: 95% Exploration reached!");
+                            println!("COVERAGE: {:.2}%", percent);
+                            println!("TIME: {:.2}s", duration.as_secs_f32());
+                            std::process::exit(0);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Periodic progress update for orchestrator to see
+        if start_time.elapsed().as_secs() % 10 == 0 {
+             let explored = master_map.explored_area();
+             let percent = (explored / total_area) * 100.0;
+             println!("PROGRESS: {:.2}%", percent);
+        }
+    }
+}
+
+async fn ui_main(seed: u32, base_port: u32) {
+    let env = Arc::new(Environment::new(seed));
     
     let (render_tx, mut render_rx) = mpsc::unbounded_channel();
     
@@ -55,7 +132,7 @@ async fn main() {
         rt.block_on(async {
             for id in 1..=DRONE_COUNT {
                 let drone = Drone::new(id, environment::MAP_WIDTH / 2.0 + (id as f32 * 50.0), environment::MAP_HEIGHT / 2.0);
-                tokio::spawn(drone.run_drone_task(env_clone.clone(), render_tx.clone()));
+                tokio::spawn(drone.run_drone_task(env_clone.clone(), render_tx.clone(), false, base_port));
             }
             
             loop {
@@ -67,6 +144,7 @@ async fn main() {
     let mut is_map_open = false;
     let mut is_zoomed_out = false;
     let mut is_path_visible = true;
+    let mut is_heatmap_visible = false;
     let mut drone_states: HashMap<u32, RenderState> = HashMap::new();
     let mut master_map = quadtree::Quadtree::new(Rect::new(0.0, 0.0, environment::MAP_WIDTH, environment::MAP_HEIGHT), 9);
     
@@ -81,6 +159,9 @@ async fn main() {
         }
         if is_key_pressed(KeyCode::V) {
             is_path_visible = !is_path_visible;
+        }
+        if is_key_pressed(KeyCode::H) {
+            is_heatmap_visible = !is_heatmap_visible;
         }
         if is_key_pressed(KeyCode::C) {
             camera_target_id += 1;
@@ -133,8 +214,28 @@ async fn main() {
         } else {
             master_map.draw(camera_bounds);
             
+            if is_heatmap_visible {
+                let main_tick = (get_time() * 60.0) as u64;
+                master_map.draw_heatmap(camera_bounds, main_tick);
+            }
+            
             for state in drone_states.values() {
                 draw_circle_lines(state.position.x, state.position.y, 300.0, 2.0, Color::new(1.0, 1.0, 1.0, 0.3));
+            }
+            
+            // Draw mesh topology lines
+            for (id1, d1) in &drone_states {
+                for (id2, d2) in &drone_states {
+                    if id1 < id2 {
+                        let dist = d1.position.distance(d2.position);
+                        
+                        if dist <= 800.0 {
+                            draw_line(d1.position.x, d1.position.y, d2.position.x, d2.position.y, 2.0, GREEN);
+                        } else if dist <= 2000.0 {
+                            draw_line(d1.position.x, d1.position.y, d2.position.x, d2.position.y, 2.0, YELLOW);
+                        }
+                    }
+                }
             }
         }
 
@@ -166,21 +267,24 @@ async fn main() {
         let map_status = if is_map_open { "OPEN" } else { "CLOSED" };
         let zoom_status = if is_zoomed_out { "ALL" } else { "LOCAL" };
         let path_status = if is_path_visible { "SHOW" } else { "HIDE" };
+        let heatmap_status = if is_heatmap_visible { "ON" } else { "OFF" };
         
         let ui_text_1 = format!("O: Toggle Map (Current: {})", map_status);
         let ui_text_2 = format!("C: Cycle Camera (Tracking: Drone {})", camera_target_id);
         let ui_text_3 = format!("Z: Toggle Zoom (Current: {})", zoom_status);
         let ui_text_4 = format!("V: Toggle Pathing (Current: {})", path_status);
+        let ui_text_5 = format!("H: Toggle Heatmap (Current: {})", heatmap_status);
         
         let text_size = 20.0;
         let padding = 10.0;
         let text_x = screen_width() - 400.0;
         
-        draw_rectangle(text_x - padding, padding, 400.0, 110.0, Color::new(0.0, 0.0, 0.0, 0.7));
+        draw_rectangle(text_x - padding, padding, 400.0, 135.0, Color::new(0.0, 0.0, 0.0, 0.7));
         draw_text(&ui_text_1, text_x, padding + text_size, text_size, WHITE);
         draw_text(&ui_text_2, text_x, padding + text_size * 2.5, text_size, WHITE);
         draw_text(&ui_text_3, text_x, padding + text_size * 4.0, text_size, WHITE);
         draw_text(&ui_text_4, text_x, padding + text_size * 5.5, text_size, WHITE);
+        draw_text(&ui_text_5, text_x, padding + text_size * 7.0, text_size, WHITE);
 
         next_frame().await
     }

@@ -12,7 +12,7 @@ pub struct Environment {
 }
 
 impl Environment {
-    pub fn new() -> Self {
+    pub fn new(seed: u32) -> Self {
         let mut obstacles = Vec::with_capacity(1004);
         
         obstacles.push(Obstacle { rect: Rect::new(-100.0, -100.0, MAP_WIDTH + 200.0, 100.0) });
@@ -20,7 +20,7 @@ impl Environment {
         obstacles.push(Obstacle { rect: Rect::new(-100.0, -100.0, 100.0, MAP_HEIGHT + 200.0) });
         obstacles.push(Obstacle { rect: Rect::new(MAP_WIDTH, -100.0, 100.0, MAP_HEIGHT + 200.0) });
 
-        let mut n = 12345u32;
+        let mut n = seed;
         let mut rand_f32 = || -> f32 {
             n = n.wrapping_mul(1664525).wrapping_add(1013904223);
             (n as f32) / (u32::MAX as f32)

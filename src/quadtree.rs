@@ -224,6 +224,40 @@ impl Quadtree {
         }
     }
 
+    pub fn explored_area(&self) -> f32 {
+        Self::node_explored_area(&self.root, self.bounds)
+    }
+
+    fn node_explored_area(node: &QuadNode, bounds: Rect) -> f32 {
+        match node {
+            QuadNode::Leaf(state) => {
+                // Obstacles don't count towards exploration percentage
+                if state.explored && !state.obstacle {
+                    bounds.w * bounds.h
+                } else {
+                    0.0
+                }
+            }
+            QuadNode::Internal(children) => {
+                let hw = bounds.w / 2.0;
+                let hh = bounds.h / 2.0;
+                let x = bounds.x;
+                let y = bounds.y;
+                let quadrants = [
+                    Rect::new(x, y, hw, hh),
+                    Rect::new(x + hw, y, hw, hh),
+                    Rect::new(x, y + hh, hw, hh),
+                    Rect::new(x + hw, y + hh, hw, hh),
+                ];
+                let mut sum = 0.0;
+                for i in 0..4 {
+                    sum += Self::node_explored_area(&children[i], quadrants[i]);
+                }
+                sum
+            }
+        }
+    }
+
     fn merge_node(
         node: QuadNode,
         node_bounds: Rect,
@@ -329,6 +363,50 @@ impl Quadtree {
 
                 for i in 0..4 {
                     Self::draw_node(&children[i], quadrants[i], camera_bounds);
+                }
+            }
+        }
+    }
+
+    pub fn draw_heatmap(&self, camera_bounds: Rect, current_tick: u64) {
+        Self::draw_node_heatmap(&self.root, self.bounds, camera_bounds, current_tick);
+    }
+
+    fn draw_node_heatmap(node: &QuadNode, bounds: Rect, camera_bounds: Rect, current_tick: u64) {
+        if !bounds.overlaps(&camera_bounds) {
+            return;
+        }
+
+        match node {
+            QuadNode::Leaf(state) => {
+                let color = if !state.explored {
+                    Color::new(1.0, 0.0, 0.0, 0.4) // Red for unknown
+                } else if state.obstacle {
+                    Color::new(0.0, 0.0, 0.0, 0.6) // Dark for obstacle
+                } else {
+                    let age = current_tick.saturating_sub(state.last_seen) as f32;
+                    // Max stale at 30 seconds (30 * 60 = 1800 ticks)
+                    let staleness = (age / 1800.0).clamp(0.0, 1.0);
+                    // Blue for fresh, Red for stale
+                    Color::new(staleness, 0.0, 1.0 - staleness, 0.4)
+                };
+                draw_rectangle(bounds.x, bounds.y, bounds.w, bounds.h, color);
+            }
+            QuadNode::Internal(children) => {
+                let hw = bounds.w / 2.0;
+                let hh = bounds.h / 2.0;
+                let x = bounds.x;
+                let y = bounds.y;
+
+                let quadrants = [
+                    Rect::new(x, y, hw, hh),
+                    Rect::new(x + hw, y, hw, hh),
+                    Rect::new(x, y + hh, hw, hh),
+                    Rect::new(x + hw, y + hh, hw, hh),
+                ];
+
+                for i in 0..4 {
+                    Self::draw_node_heatmap(&children[i], quadrants[i], camera_bounds, current_tick);
                 }
             }
         }
